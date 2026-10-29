@@ -36,6 +36,14 @@ class NoScrollTable(QTableWidget):
 class DeckReinforcementCADWidget(QWidget):
     """Responsive schematic of deck reinforcement and girder position."""
 
+    _CAD_ROW_IDENTIFIERS = {
+        "T1": ("Transverse", "Interior", "Top"),
+        "T2": ("Transverse", "Overhang", "Top"),
+        "T3": ("Longitudinal", "Full deck", "Top"),
+        "B1": ("Longitudinal", "Full deck", "Bottom"),
+        "B2": ("Transverse", "Full deck", "Bottom"),
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(300, 240)
@@ -57,44 +65,73 @@ class DeckReinforcementCADWidget(QWidget):
         return str(value) if value not in (None, "") else default
 
     def _map_reinforcement_data(self, designation: str):
-        mapping = {
-            # Row 2: Transverse, Interior, Top
-            "T1": {
-                "keys": ("rebar_long_dia", "rebar_long_spacing"),
-            },
+        identifiers = self._CAD_ROW_IDENTIFIERS.get(designation)
+        if not identifiers:
+            return {}
 
-            # Row 3: Transverse, Overhang, Top
-            # T2 replaces T1 in the overhang.
-            "T2": {
-                "keys": ("rebar_overhang_dia", "rebar_overhang_spacing"),
-            },
+        direction, zone, face = identifiers
+        rows = DECK_DESIGN_SUMMARY_SCHEMA.get("reinforcement_table", {}).get(
+            "rows", []
+        )
+        return next(
+            (
+                row
+                for row in rows
+                if (
+                    row.get("direction") == direction
+                    and row.get("zone") == zone
+                    and row.get("face") == face
+                )
+            ),
+            {},
+        )
 
-            # Row 5: Longitudinal, Full deck, Top
-            "T3": {
-                "keys": ("rebar_top_dia", "rebar_top_spacing"),
-            },
-
-            # Row 4: Longitudinal, Full deck, Bottom
-            "B1": {
-                "keys": ("rebar_long_dia", "rebar_long_spacing"),
-            },
-
-            # Row 1: Transverse, Full deck, Bottom
-            "B2": {
-                "keys": ("rebar_bottom_dia", "rebar_bottom_spacing"),
-            },
+    def _reinforcement_data(self) -> dict:
+        rows = DECK_DESIGN_SUMMARY_SCHEMA.get("reinforcement_table", {}).get(
+            "rows", []
+        )
+        row_fields = (
+            "bar_key",
+            "spacing_key",
+            "provided_key",
+            "required_key",
+            "cover_key",
+            "depth_key",
+        )
+        required_keys = {
+            row.get(field)
+            for row in rows
+            for field in row_fields
+            if row.get(field)
         }
-        return mapping.get(designation, {})
+        return {
+            key: self._data[key]
+            for key in self._data.keys()
+            if key in required_keys
+        }
+
+    def _reinforcement_value(
+        self, designation: str, data_field: str, default=""
+    ) -> str:
+        row = self._map_reinforcement_data(designation)
+        data_key = row.get(data_field)
+        return (
+            str(self._reinforcement_data().get(data_key, default))
+            if data_key
+            else default
+        )
 
 
     def _reinforcement_info(self, designation: str):
-        info = self._map_reinforcement_data(designation)
-        if not info:
+        if not self._map_reinforcement_data(designation):
             return None
 
-        dia_key, spacing_key = info["keys"]
-        dia = self._number(self._data.get(dia_key), 0.0)
-        spacing = self._number(self._data.get(spacing_key), 0.0)
+        dia = self._number(
+            self._reinforcement_value(designation, "bar_key"), 0.0
+        )
+        spacing = self._number(
+            self._reinforcement_value(designation, "spacing_key"), 0.0
+        )
 
         if dia <= 0 or spacing <= 0:
             return None
@@ -383,16 +420,20 @@ class DeckReinforcementCADWidget(QWidget):
             painter.end()
             return
 
-        cover_top = self._number(self._value("rebar_top_cover"), 50.0)
-        cover_bottom = self._number(
-            self._value("rebar_bottom_cover"), 50.0
+        cover_top = self._number(
+            self._reinforcement_value("T1", "cover_key"), 50.0
         )
-        top_dia = self._number(self._value("rebar_top_dia"), 0.0)
+        cover_bottom = self._number(
+            self._reinforcement_value("B2", "cover_key"), 50.0
+        )
+        top_dia = self._number(
+            self._reinforcement_value("T1", "bar_key"), 0.0
+        )
         bottom_dia = self._number(
-            self._value("rebar_bottom_dia"), 0.0
+            self._reinforcement_value("B2", "bar_key"), 0.0
         )
         overhang_dia = self._number(
-            self._value("rebar_overhang_dia"), 0.0
+            self._reinforcement_value("T2", "bar_key"), 0.0
         )
         # Effective depths measured from the slab surfaces.
         # B1: bottom reinforcement, measured from the top surface.
@@ -505,13 +546,13 @@ class DeckReinforcementCADWidget(QWidget):
         painter.setBrush(marker_color)
 
         top_spacing = self._number(
-            self._value("rebar_top_spacing"), 200.0
+            self._reinforcement_value("T1", "spacing_key"), 200.0
         )
         overhang_spacing = self._number(
-            self._value("rebar_overhang_spacing"), top_spacing
+            self._reinforcement_value("T2", "spacing_key"), top_spacing
         )
         bottom_spacing = self._number(
-            self._value("rebar_bottom_spacing"), 200.0
+            self._reinforcement_value("B2", "spacing_key"), 200.0
         )
 
         def draw_markers(
