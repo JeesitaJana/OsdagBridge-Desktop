@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QSizeGrip,
 )
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt, QPoint, QBuffer, QIODevice
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 
 from osdagbridge_desktop.ui.dialogs.tabs.common import apply_field_style
 from osdagbridge_desktop.ui.utils.styled_scroll_area import StyledScrollArea
@@ -36,6 +36,7 @@ class NoScrollTable(QTableWidget):
 class DeckReinforcementCADWidget(QWidget):
     """Responsive schematic of deck reinforcement and girder position."""
 
+    _CACHE_SCALE = 3
     _CAD_ROW_IDENTIFIERS = {
         "T1": ("Transverse", "Interior", "Top"),
         "T2": ("Transverse", "Overhang", "Top"),
@@ -46,12 +47,82 @@ class DeckReinforcementCADWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._data: dict = {}
+        self._cached_data = None
+        self._cached_size = None
+        self._cached_image = None
+        self._cached_png_bytes = None
         self.setMinimumSize(300, 240)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_data(self, data: dict) -> None:
-        self._data = dict(data or {})
-        self.update()
+        new_data = dict(data or {})
+        if new_data != self._data:
+            self._data = new_data
+            self._invalidate_cache()
+            self.update()
+
+    def _invalidate_cache(self) -> None:
+        self._cached_data = None
+        self._cached_size = None
+        self._cached_image = None
+        self._cached_png_bytes = None
+
+    def resizeEvent(self, event) -> None:
+        if self._cached_size != self._expected_cache_size():
+            self._invalidate_cache()
+        super().resizeEvent(event)
+
+    def _expected_cache_size(self):
+        return (
+            self.width() * self._CACHE_SCALE,
+            self.height() * self._CACHE_SCALE,
+        )
+
+    def _cache_is_valid(self) -> bool:
+        return (
+            self._cached_png_bytes is not None
+            and self._cached_data == self._data
+            and self._cached_size == self._expected_cache_size()
+            and self._cached_image is not None
+            and (
+                self._cached_image.width(),
+                self._cached_image.height(),
+            ) == self._cached_size
+        )
+
+    def _ensure_cache(self) -> None:
+        if self._cache_is_valid():
+            return
+
+        image = QImage(
+            *self._expected_cache_size(),
+            QImage.Format_ARGB32_Premultiplied,
+        )
+        image.fill(QColor("#ffffff"))
+        painter = QPainter(image)
+        painter.scale(self._CACHE_SCALE, self._CACHE_SCALE)
+        self._draw_cad(painter)
+        painter.end()
+
+        buffer = QBuffer()
+        if not buffer.open(QIODevice.WriteOnly):
+            raise RuntimeError("Could not open deck reinforcement image buffer")
+        try:
+            if not image.save(buffer, "PNG"):
+                raise RuntimeError("Could not encode deck reinforcement CAD")
+            self._cached_data = dict(self._data)
+            self._cached_size = self._expected_cache_size()
+            self._cached_image = image
+            self._cached_png_bytes = bytes(buffer.data())
+        finally:
+            buffer.close()
+
+    def cached_png(self, data: dict = None) -> bytes:
+        if data is not None and dict(data or {}) != self._data:
+            self.set_data(data)
+        self._ensure_cache()
+        return self._cached_png_bytes
 
     @staticmethod
     def _number(value, default=0.0) -> float:
@@ -63,6 +134,25 @@ class DeckReinforcementCADWidget(QWidget):
     def _value(self, key: str, default="") -> str:
         value = self._data.get(key, default)
         return str(value) if value not in (None, "") else default
+
+    def _property_value(self, label: str, default="") -> str:
+        fields = DECK_DESIGN_SUMMARY_SCHEMA.get(
+            "properties_card", {}
+        ).get("fields", [])
+
+        data_key = next(
+            (
+                field.get("data_key")
+                for field in fields
+                if field.get("label") == label
+            ),
+            None,
+        )
+
+        if not data_key:
+            return default
+
+        return self._value(data_key, default)
 
     def _map_reinforcement_data(self, designation: str):
         identifiers = self._CAD_ROW_IDENTIFIERS.get(designation)
@@ -85,28 +175,32 @@ class DeckReinforcementCADWidget(QWidget):
             ),
             {},
         )
-
+    @staticmethod
+    def _schema_key_map(row: dict) -> dict:
+        """Resolve schema field roles to their actual data keys."""
+        return {
+            field_name[:-4]: data_key
+            for field_name, data_key in row.items()
+            if (
+                isinstance(field_name, str)
+                and field_name.endswith("_key")
+                and isinstance(data_key, str)
+                and data_key
+            )
+        }
     def _reinforcement_data(self) -> dict:
-        rows = DECK_DESIGN_SUMMARY_SCHEMA.get("reinforcement_table", {}).get(
-            "rows", []
-        )
-        row_fields = (
-            "bar_key",
-            "spacing_key",
-            "provided_key",
-            "required_key",
-            "cover_key",
-            "depth_key",
-        )
+        rows = DECK_DESIGN_SUMMARY_SCHEMA.get(
+            "reinforcement_table", {}
+        ).get("rows", [])
+
         required_keys = {
-            row.get(field)
+            data_key
             for row in rows
-            for field in row_fields
-            if row.get(field)
+            for data_key in self._schema_key_map(row).values()
         }
         return {
             key: self._data[key]
-            for key in self._data.keys()
+            for key in self._data
             if key in required_keys
         }
 
@@ -114,11 +208,13 @@ class DeckReinforcementCADWidget(QWidget):
         self, designation: str, data_field: str, default=""
     ) -> str:
         row = self._map_reinforcement_data(designation)
-        data_key = row.get(data_field)
-        return (
-            str(self._reinforcement_data().get(data_key, default))
-            if data_key
-            else default
+        data_key = self._schema_key_map(row).get(data_field)
+
+        if not data_key:
+            return default
+
+        return str(
+            self._reinforcement_data().get(data_key, default)
         )
 
 
@@ -127,10 +223,10 @@ class DeckReinforcementCADWidget(QWidget):
             return None
 
         dia = self._number(
-            self._reinforcement_value(designation, "bar_key"), 0.0
+            self._reinforcement_value(designation, "bar"), 0.0
         )
         spacing = self._number(
-            self._reinforcement_value(designation, "spacing_key"), 0.0
+            self._reinforcement_value(designation, "spacing"), 0.0
         )
 
         if dia <= 0 or spacing <= 0:
@@ -236,70 +332,6 @@ class DeckReinforcementCADWidget(QWidget):
                 label,
             )
 
-    def _draw_vertical_arrow(
-        self,
-        painter,
-        x,
-        base_y,
-        direction,
-        size=7,
-        half_width=3,
-        shaft_length=10,
-    ):
-        """Draw a thin, hollow vertical arrow with an extended shaft."""
-        color = QColor("#709900")
-        painter.setPen(QPen(color, 1))
-        painter.setBrush(Qt.NoBrush)
-
-        x = int(x)
-        base_y = int(base_y)
-        size = int(size)
-        half_width = int(half_width)
-        shaft_length = int(shaft_length)
-
-        if direction == "down":
-            # Shaft extends upward from the flat base.
-            painter.drawLine(
-                x, base_y - shaft_length,
-                x, base_y,
-            )
-
-            # Hollow triangular arrowhead points downward.
-            painter.drawLine(
-                x - half_width, base_y,
-                x, base_y + size,
-            )
-            painter.drawLine(
-                x, base_y + size,
-                x + half_width, base_y,
-            )
-            painter.drawLine(
-                x + half_width, base_y,
-                x - half_width, base_y,
-            )
-
-        else:
-            # Shaft extends downward from the flat base.
-            painter.drawLine(
-                x, base_y,
-                x, base_y + shaft_length,
-            )
-
-            # Hollow triangular arrowhead points upward.
-            painter.drawLine(
-                x - half_width, base_y,
-                x, base_y - size,
-            )
-            painter.drawLine(
-                x, base_y - size,
-                x + half_width, base_y,
-            )
-            painter.drawLine(
-                x + half_width, base_y,
-                x - half_width, base_y,
-            )
-
-
     def _draw_vertical_dimension_arrows(
         self, painter, x, y_top, y_bottom
     ):
@@ -396,7 +428,13 @@ class DeckReinforcementCADWidget(QWidget):
                 line,
             )
     def paintEvent(self, _event):
+        self._ensure_cache()
         painter = QPainter(self)
+        painter.drawImage(self.rect(), self._cached_image)
+        painter.end()
+
+    def _draw_cad(self, painter):
+        painter.fillRect(self.rect(), QColor("#ffffff"))
         painter.setRenderHint(QPainter.Antialiasing)
 
         bounds = self.rect().adjusted(10, 10, -10, -10)
@@ -408,38 +446,42 @@ class DeckReinforcementCADWidget(QWidget):
             Qt.AlignHCenter | Qt.AlignTop, "Deck Reinforcement"
         )
         overhang_mm = self._number(
-            self._value("deck_overhang"), 0.0
+            self._property_value("Deck Overhang (mm):"), 0.0
         )
-        thickness = self._number(self._value("deck_thickness"), 0.0)
+        thickness = self._number(
+            self._property_value("Thickness (mm):"), 0.0
+        )
         if thickness <= 0:
             painter.setFont(QFont("Arial", 9))
             painter.drawText(
                 bounds.adjusted(0, 30, 0, 0), Qt.AlignCenter,
                 "Deck thickness unavailable"
             )
-            painter.end()
             return
 
         cover_top = self._number(
-            self._reinforcement_value("T1", "cover_key"), 50.0
+            self._reinforcement_value("T1", "cover"), 50.0
         )
         cover_bottom = self._number(
-            self._reinforcement_value("B2", "cover_key"), 50.0
+            self._reinforcement_value("B2", "cover"), 50.0
         )
         top_dia = self._number(
-            self._reinforcement_value("T1", "bar_key"), 0.0
+            self._reinforcement_value("T1", "bar"), 0.0
         )
         bottom_dia = self._number(
-            self._reinforcement_value("B2", "bar_key"), 0.0
+            self._reinforcement_value("B2", "bar"), 0.0
         )
-        overhang_dia = self._number(
-            self._reinforcement_value("T2", "bar_key"), 0.0
+        # Use the effective depths calculated by the Core design.
+        # B2: transverse bottom reinforcement.
+        # T1: transverse top reinforcement in the interior zone.
+        d_bottom = self._number(
+            self._reinforcement_value("B2", "depth"),
+            0.0,
         )
-        # Effective depths measured from the slab surfaces.
-        # B1: bottom reinforcement, measured from the top surface.
-        # B2: top reinforcement, measured from the bottom surface.
-        d_b1 = thickness - cover_bottom - bottom_dia / 2
-        d_b2 = thickness - cover_top - top_dia / 2
+        d_top = self._number(
+            self._reinforcement_value("T1", "depth"),
+            0.0,
+        )
 
         left = bounds.left() + 22
         right = bounds.right() - 100
@@ -495,8 +537,20 @@ class DeckReinforcementCADWidget(QWidget):
             int(slab_right), int(top + slab_height * 0.70),
             int(slab_right), int(slab_bottom)
         )
-        top_offset = max(8, min(slab_height * 0.28, cover_top / thickness * slab_height))
-        bottom_offset = max(8, min(slab_height * 0.28, cover_bottom / thickness * slab_height))
+        top_offset = max(
+            8,
+            min(
+                slab_height * 0.28,
+                (cover_top + top_dia / 2.0) / thickness * slab_height,
+            ),
+        )
+        bottom_offset = max(
+            8,
+            min(
+                slab_height * 0.28,
+                (cover_bottom + bottom_dia / 2.0) / thickness * slab_height,
+            ),
+        )
         top_y = top + top_offset
         bottom_y = slab_bottom - bottom_offset
 
@@ -546,13 +600,13 @@ class DeckReinforcementCADWidget(QWidget):
         painter.setBrush(marker_color)
 
         top_spacing = self._number(
-            self._reinforcement_value("T1", "spacing_key"), 200.0
+            self._reinforcement_value("T1", "spacing"), 200.0
         )
         overhang_spacing = self._number(
-            self._reinforcement_value("T2", "spacing_key"), top_spacing
+            self._reinforcement_value("T2", "spacing"), top_spacing
         )
         bottom_spacing = self._number(
-            self._reinforcement_value("B2", "spacing_key"), 200.0
+            self._reinforcement_value("B2", "spacing"), 200.0
         )
 
         def draw_markers(
@@ -855,7 +909,7 @@ class DeckReinforcementCADWidget(QWidget):
         painter.setPen(QPen(QColor("#709900"), 1))
         painter.setFont(QFont("Arial", 8))
 
-        # d (B1): horizontal extension lines begin at slab edge
+        # Bottom transverse effective depth.
         painter.drawLine(
             int(slab_right), int(top),
             int(depth_x1), int(top),
@@ -865,17 +919,17 @@ class DeckReinforcementCADWidget(QWidget):
             int(depth_x1), int(bottom_y),
         )
 
-        # d (B1): vertical dimension line
+        # Bottom transverse effective depth: vertical dimension line
         painter.drawLine(
             int(depth_x1), int(top),
             int(depth_x1), int(bottom_y),
         )
-        # d (B1): filled arrowheads pointing outward.
+        # Bottom transverse effective depth: filled arrowheads pointing outward.
         painter.setBrush(QColor("#709900"))
         self._draw_vertical_dimension_arrows(
             painter, depth_x1, top, bottom_y
         )
-        # d (B2): horizontal extension lines begin at slab edge
+        # Top transverse effective depth: horizontal extension lines begin at slab edge
         painter.drawLine(
             int(slab_right), int(top_y),
             int(depth_x2), int(top_y),
@@ -885,12 +939,12 @@ class DeckReinforcementCADWidget(QWidget):
             int(depth_x2), int(slab_bottom),
         )
 
-        # d (B2): vertical dimension line
+        # Top transverse effective depth: vertical dimension line
         painter.drawLine(
             int(depth_x2), int(top_y),
             int(depth_x2), int(slab_bottom),
         )
-        # d (B2): filled arrowheads pointing outward.
+        # Top transverse effective depth: filled arrowheads pointing outward.
         painter.setBrush(QColor("#709900"))
         self._draw_vertical_dimension_arrows(
             painter, depth_x2, top_y, slab_bottom
@@ -904,7 +958,7 @@ class DeckReinforcementCADWidget(QWidget):
             60,
             14,
             Qt.AlignHCenter | Qt.AlignVCenter,
-            f"{d_b1:g} mm",
+            f"{d_bottom:g} mm",
         )
 
         painter.drawText(
@@ -913,7 +967,7 @@ class DeckReinforcementCADWidget(QWidget):
             60,
             14,
             Qt.AlignHCenter | Qt.AlignVCenter,
-            f"{d_b2:g} mm",
+            f"{d_top:g} mm",
         )
         if overhang_mm > 0:
             dimension_y = slab_bottom + 63
@@ -1017,7 +1071,48 @@ class DeckReinforcementCADWidget(QWidget):
                 label_pos,
             )
 
-        painter.end()
+
+
+class DeckReinforcementCADCard(QFrame):
+    """Card that owns the deck reinforcement CAD preview and its styling."""
+
+    CARD_HEIGHT = 260
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setObjectName("deckReinforcementCADCard")
+        self.setStyleSheet(
+            "QFrame#deckReinforcementCADCard {"
+            "  background-color: white;"
+            "  border: 1px solid #b0b0b0;"
+            "  border-radius: 6px;"
+            "}"
+        )
+
+        self.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+        self.setFixedHeight(self.CARD_HEIGHT)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(0)
+
+        self.cad_widget = DeckReinforcementCADWidget(self)
+        self.cad_widget.setMinimumSize(300, 240)
+        self.cad_widget.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Expanding,
+        )
+
+        layout.addWidget(self.cad_widget)
+
+    def set_data(self, data: dict) -> None:
+        """Pass deck design results to the CAD drawing widget."""
+        self.cad_widget.set_data(data)
+
 class DeckDesign(QDialog):
     """
     Deck Design dialog — schema-driven dialog that displays deck properties, 
@@ -1083,16 +1178,9 @@ class DeckDesign(QDialog):
         container_layout = QVBoxLayout(container)
         container_layout.setContentsMargins(10, 10, 10, 10)
         container_layout.setSpacing(8)
-        self.reinforcement_cad_card = self._create_card_frame()
 
-        self.reinforcement_cad = DeckReinforcementCADWidget(
-            self.reinforcement_cad_card
-       )
+        self.reinforcement_cad_card = DeckReinforcementCADCard(container)
 
-        cad_layout = QVBoxLayout(self.reinforcement_cad_card)
-        cad_layout.setContentsMargins(4, 4, 4, 4)
-        cad_layout.setSpacing(0)
-        cad_layout.addWidget(self.reinforcement_cad)
         # Deck Properties and CAD preview share the top row.
         props_row = QHBoxLayout()
         props_row.setContentsMargins(0, 0, 0, 0)
@@ -1100,18 +1188,10 @@ class DeckDesign(QDialog):
 
         properties_card = self._build_properties_section()
         properties_card.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
         )
         properties_card.setFixedHeight(260)
-        self.reinforcement_cad_card.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed
-        )
-        self.reinforcement_cad_card.setFixedHeight(260)
-
-        self.reinforcement_cad.setMinimumSize(300, 240)
-        self.reinforcement_cad.setSizePolicy(
-        QSizePolicy.Expanding, QSizePolicy.Expanding
-        )
 
         props_row.addWidget(properties_card, 2, Qt.AlignTop)
         props_row.addWidget(self.reinforcement_cad_card, 3, Qt.AlignTop)
@@ -1448,7 +1528,7 @@ class DeckDesign(QDialog):
                 self._prop_fields[data_key].setText(str(output_dict.get(data_key, "")))
 
         # ── Reinforcement table ───────────────────────────────────────────────
-        self.reinforcement_cad.set_data(output_dict)
+        self.reinforcement_cad_card.set_data(output_dict)
 
         reinf_schema = self.schema.get("reinforcement_table", {})
         rows_def = reinf_schema.get("rows", [])
@@ -1459,26 +1539,41 @@ class DeckDesign(QDialog):
         for row, row_def in enumerate(rows_def):
             is_overhang = row_def.get("is_overhang", False)
 
+            field_keys = DeckReinforcementCADWidget._schema_key_map(
+                row_def
+            )
+
             if is_overhang:
-                has_overhang = bool(output_dict.get(row_def.get("bar_key", "")))
-                self.rebar_table.setRowHidden(row, not has_overhang)
+                bar_data_key = field_keys.get("bar")
+                has_overhang = (
+                    bool(output_dict.get(bar_data_key, ""))
+                    if bar_data_key
+                    else False
+                )
+
+                self.rebar_table.setRowHidden(
+                    row, not has_overhang
+                )
+
                 if not has_overhang:
                     continue
 
-            data_keys = (
-                "bar_key",
-                "spacing_key",
-                "provided_key",
-                "required_key",
-                "cover_key",
-                "depth_key",
-            )
-            for col, key_name in enumerate(data_keys, start=3):
-                value = output_dict.get(row_def.get(key_name, ""), "")
-                if value and key_name == "cover_key":
-                    value = f"{value}{cover_face.get(row_def.get('face', ''), '')}"
-                elif value and key_name == "depth_key":
-                    value = f"{value}{depth_face.get(row_def.get('face', ''), '')}"
+            for col, (field_role, data_key) in enumerate(
+                field_keys.items(), start=3
+            ):
+                value = output_dict.get(data_key, "")
+
+                if value and field_role == "cover":
+                    value = (
+                        f"{value}"
+                        f"{cover_face.get(row_def.get('face', ''), '')}"
+                    )
+                elif value and field_role == "depth":
+                    value = (
+                        f"{value}"
+                        f"{depth_face.get(row_def.get('face', ''), '')}"
+                    )
+
                 item = QTableWidgetItem(str(value))
                 item.setFlags(Qt.ItemIsEnabled)
                 item.setTextAlignment(Qt.AlignCenter)
