@@ -114,7 +114,6 @@ class AdditionalInputs(QDialog):
         self.tabs = QTabWidget()
         self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.stretching_tab_bar = QTabBar()
-        self.stretching_tab_bar.setElideMode(Qt.ElideRight)
         self.tabs.setTabBar(self.stretching_tab_bar)
         self.tabs.setStyleSheet("""
             QTabWidget::pane {
